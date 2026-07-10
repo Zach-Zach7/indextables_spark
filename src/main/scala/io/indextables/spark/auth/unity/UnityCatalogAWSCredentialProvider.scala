@@ -46,14 +46,24 @@ import org.slf4j.LoggerFactory
  *
  * ===Auth Modes===
  *
- * Two mutually exclusive auth strategies are supported:
- *
- * '''Static API token''' (original mode):
- *   - spark.indextables.databricks.apiToken: Databricks personal access token
+ * Three mutually exclusive auth strategies are supported (highest priority first):
  *
  * '''OAuth2 Client Credentials''' (machine-to-machine, no personal token needed):
  *   - spark.indextables.databricks.clientId: OAuth2 client ID
  *   - spark.indextables.databricks.clientSecret: OAuth2 client secret
+ *
+ * '''Static API token''' (original mode):
+ *   - spark.indextables.databricks.apiToken: Databricks personal access token
+ *
+ * '''Ambient cluster token''' (zero-config, Databricks compute only): when neither of the above is configured, the
+ * provider falls back to the cluster-scoped service token that Databricks injects into every cluster's SparkConf as
+ * `spark.databricks.token`. UC API calls made with this token originate from within the Databricks compute plane, so
+ * they are not subject to the metastore's `external_access_enabled` gate (no EXTERNAL_ACCESS_DISABLED_ON_METASTORE
+ * 403). In this mode the workspace URL is also auto-resolved from `spark.databricks.workspaceUrl` when
+ * `spark.indextables.databricks.workspaceUrl` is not set (Databricks stores a bare hostname there — an `https://`
+ * scheme is prepended automatically). The token is re-read from SparkConf on every call since Databricks rotates it
+ * periodically. SparkConf is read via `SparkEnv.get.conf` reflection, which works on both the driver and executors
+ * without creating a SparkContext.
  *
  * When both OAuth keys are present they take precedence. Partial OAuth config (only one of the two keys) is an error.
  * OAuth tokens are exchanged via the workspace-level OIDC endpoint at `{workspaceUrl}/oidc/v1/token` using HTTP Basic
@@ -319,6 +329,12 @@ object UnityCatalogAWSCredentialProvider extends io.indextables.spark.utils.Tabl
   // Production deployments MUST use HTTPS workspace URLs.
   private[unity] val AllowInsecureOAuthKey = "oauth.allowInsecure"
 
+  // Ambient Databricks cluster conf keys. Databricks injects these into every cluster's SparkConf
+  // at startup; they are not user-set. Used as the lowest-priority auth fallback so that jobs
+  // running on Databricks compute need zero explicit auth configuration.
+  private[unity] val AmbientTokenConfKey        = "spark.databricks.token"
+  private[unity] val AmbientWorkspaceUrlConfKey = "spark.databricks.workspaceUrl"
+
   // Default values
   private val DefaultRefreshBufferMinutes = 40
   private val DefaultCacheMaxSize         = 100
@@ -350,12 +366,54 @@ object UnityCatalogAWSCredentialProvider extends io.indextables.spark.utils.Tabl
   }
 
   /**
+   * Read a key from the active Spark runtime's SparkConf via reflection.
+   *
+   * Uses `SparkEnv.get.conf` rather than `SparkContext.getOrCreate`: SparkEnv exists on both the driver AND executors
+   * (this provider runs on executors during scan fan-out), and `get` returns null instead of side-effecting when no
+   * Spark runtime is active. Reflection keeps this class free of compile-time Spark dependencies, consistent with the
+   * rest of the file. Returns None when Spark is not on the classpath or no runtime is active (e.g. plain JVM tests).
+   */
+  private[unity] def readSparkEnvConf(key: String): Option[String] =
+    Try {
+      val envClass = Class.forName("org.apache.spark.SparkEnv")
+      Option(envClass.getMethod("get").invoke(null)).flatMap { env =>
+        val conf = envClass.getMethod("conf").invoke(env)
+        conf.getClass
+          .getMethod("getOption", classOf[String])
+          .invoke(conf, key)
+          .asInstanceOf[Option[String]]
+          .map(_.trim)
+          .filter(_.nonEmpty)
+      }
+    }.toOption.flatten
+
+  /** The cluster-scoped service token Databricks injects into SparkConf, when running on Databricks compute. */
+  private[unity] def resolveAmbientClusterToken(): Option[String] =
+    readSparkEnvConf(AmbientTokenConfKey)
+
+  /**
+   * The workspace URL Databricks injects into SparkConf. Databricks stores a bare hostname (no scheme), so the value is
+   * normalized to an https:// URL.
+   */
+  private[unity] def resolveAmbientWorkspaceUrl(): Option[String] =
+    readSparkEnvConf(AmbientWorkspaceUrlConfKey).map(normalizeWorkspaceUrl)
+
+  /** Prepend https:// when no scheme is present and strip any trailing slash. */
+  private[unity] def normalizeWorkspaceUrl(url: String): String = {
+    val withScheme =
+      if (url.startsWith("https://") || url.startsWith("http://")) url
+      else s"https://$url"
+    if (withScheme.endsWith("/")) withScheme.dropRight(1) else withScheme
+  }
+
+  /**
    * Resolve Databricks configuration from a Map[String, String]. This is the fast path that avoids Hadoop Configuration
    * creation.
    *
    * Auth mode priority:
    *   1. ClientCredentials — when clientId + clientSecret are both present 2. StaticToken — when apiToken is present 3.
-   *      Error — neither is configured
+   *      AmbientClusterToken — when running on Databricks compute (spark.databricks.token present in SparkConf) 4.
+   *      Error — none of the above
    */
   private def resolveConfigFromMap(config: Map[String, String]): (String, AuthMode, Int, Int) = {
     val sources: Seq[ConfigSource] = Seq(
@@ -363,14 +421,17 @@ object UnityCatalogAWSCredentialProvider extends io.indextables.spark.utils.Tabl
       MapConfigSource(config)
     )
 
-    val workspaceUrl = ConfigurationResolver
+    // Explicit workspace URL. Required for StaticToken and ClientCredentials modes (unchanged
+    // behavior); for AmbientClusterToken mode it falls back to spark.databricks.workspaceUrl below.
+    val explicitWorkspaceUrl = ConfigurationResolver
       .resolveString(WorkspaceUrlKey, sources)
       .map(url => if (url.endsWith("/")) url.dropRight(1) else url)
-      .getOrElse(
-        throw new IllegalStateException(
-          "Databricks workspace URL not configured. Set spark.indextables.databricks.workspaceUrl"
-        )
+
+    def requireExplicitWorkspaceUrl(): String = explicitWorkspaceUrl.getOrElse(
+      throw new IllegalStateException(
+        "Databricks workspace URL not configured. Set spark.indextables.databricks.workspaceUrl"
       )
+    )
 
     // Resolve OAuth keys through ConfigurationResolver for the same prefix-aware, case-insensitive,
     // and log-masked semantics as apiToken (bare-leaf keys + spark.indextables.databricks.* prefix).
@@ -379,6 +440,7 @@ object UnityCatalogAWSCredentialProvider extends io.indextables.spark.utils.Tabl
 
     val authMode: AuthMode = (clientId, clientSecret) match {
       case (Some(id), Some(secret)) if id.nonEmpty && secret.nonEmpty =>
+        val workspaceUrl = requireExplicitWorkspaceUrl()
         // HTTPS validation: Basic Auth sends base64-encoded credentials — must not go over plaintext.
         if (!workspaceUrl.startsWith("https://")) {
           val allowInsecure = ConfigurationResolver.resolveBoolean(AllowInsecureOAuthKey, sources, default = false)
@@ -409,15 +471,37 @@ object UnityCatalogAWSCredentialProvider extends io.indextables.spark.utils.Tabl
             "To use a static API token instead, remove both OAuth keys and set apiToken."
         )
       case _ =>
-        val token = ConfigurationResolver
-          .resolveString(TokenKey, sources, logMask = true)
+        ConfigurationResolver.resolveString(TokenKey, sources, logMask = true) match {
+          case Some(token) => StaticToken(token)
+          case None =>
+            resolveAmbientClusterToken() match {
+              case Some(token) =>
+                logger.info(
+                  "Using ambient Databricks cluster token (spark.databricks.token) for UC credential vending"
+                )
+                AmbientClusterToken(token)
+              case None =>
+                throw new IllegalStateException(
+                  "Databricks auth not configured. Set spark.indextables.databricks.apiToken, " +
+                    "spark.indextables.databricks.clientId/clientSecret, " +
+                    "or run on a Databricks cluster (spark.databricks.token is auto-detected)."
+                )
+            }
+        }
+    }
+
+    val workspaceUrl = authMode match {
+      case cc: ClientCredentials => cc.workspaceUrl
+      case _: AmbientClusterToken =>
+        explicitWorkspaceUrl
+          .orElse(resolveAmbientWorkspaceUrl())
           .getOrElse(
             throw new IllegalStateException(
-              "Databricks auth not configured. Set spark.indextables.databricks.apiToken " +
-                "or spark.indextables.databricks.clientId/clientSecret."
+              "Databricks workspace URL not configured. Set spark.indextables.databricks.workspaceUrl " +
+                "(auto-detection via spark.databricks.workspaceUrl found no value)"
             )
           )
-        StaticToken(token)
+      case _ => requireExplicitWorkspaceUrl()
     }
 
     val refreshBuffer = ConfigurationResolver
@@ -522,7 +606,18 @@ object UnityCatalogAWSCredentialProvider extends io.indextables.spark.utils.Tabl
    * thread executes the POST; all others block, then hit the cache on wake-up.
    */
   private[unity] def resolveToken(authMode: AuthMode): String = authMode match {
-    case StaticToken(token)    => token
+    case StaticToken(token)                => token
+    case AmbientClusterToken(initialToken) =>
+      // Re-read from SparkConf on every call — Databricks rotates the cluster token periodically,
+      // so caching it would eventually produce 401s on long-running clusters. The AWS credential
+      // cache (keyed by a fixed ambient identity) still prevents redundant UC API calls.
+      resolveAmbientClusterToken().getOrElse {
+        logger.warn(
+          "Ambient Databricks cluster token no longer readable from SparkConf; " +
+            "falling back to the token captured at provider construction"
+        )
+        initialToken
+      }
     case cc: ClientCredentials =>
       // Fast path (unsynchronized) — avoids lock contention on the common case.
       val cached = if (globalOAuthTokenCache != null) globalOAuthTokenCache.getIfPresent(cc.clientId) else null
@@ -673,6 +768,9 @@ object UnityCatalogAWSCredentialProvider extends io.indextables.spark.utils.Tabl
   private def authIdentity(authMode: AuthMode): String = authMode match {
     case StaticToken(token)                         => token
     case ClientCredentials(clientId, _, _, _, _, _) => clientId
+    // Fixed identity: there is exactly one cluster token per JVM and the cache is process-global,
+    // so a stable string keeps cache entries valid across token rotations (like clientId for OAuth).
+    case _: AmbientClusterToken => "ambient-cluster-token"
   }
 
   /**
@@ -1060,9 +1158,16 @@ object UnityCatalogAWSCredentialProvider extends io.indextables.spark.utils.Tabl
     defaults
   }
 
-  /** Authentication mode — either a static API token or OAuth client credentials. */
+  /** Authentication mode — static API token, OAuth client credentials, or ambient Databricks cluster token. */
   sealed private[unity] trait AuthMode
   private[unity] case class StaticToken(token: String) extends AuthMode
+
+  /**
+   * Ambient Databricks cluster token auth (zero-config fallback). `initialToken` is the value of
+   * `spark.databricks.token` captured at provider construction; resolveToken() re-reads the live value from SparkConf
+   * on every call and only uses `initialToken` if the Spark runtime becomes unreachable.
+   */
+  private[unity] case class AmbientClusterToken(initialToken: String) extends AuthMode
   private[unity] case class ClientCredentials(
     clientId: String,
     clientSecret: String,
