@@ -223,6 +223,18 @@ class IndexTables4SparkExtensions extends (SparkSessionExtensions => Unit) {
       )
     )
 
+    // Opt-in Databricks dbutils token bootstrap. Piggybacked on a check-rule builder because
+    // SparkSessionExtensions has no dedicated on-session-start callback: the builder function runs once,
+    // at session-state (analyzer) construction, with a live SparkSession, which is exactly where we need
+    // to read dbutils and seed the session conf. The returned checker is inert (runs per query, does
+    // nothing). DbutilsTokenManager.bootstrap is idempotent and a strict no-op unless
+    // spark.indextables.databricks.dbutilsTokenRefresh.enabled=true AND a dbutils token is readable
+    // (a Databricks driver) — so this changes nothing for existing or non-Databricks deployments.
+    extensions.injectCheckRule { session =>
+      DbutilsTokenManager.bootstrap(session)
+      _ => ()
+    }
+
     // Future: Add planning strategies
     // extensions.injectPlannerStrategy { session =>
     //   // Custom planner strategies can go here

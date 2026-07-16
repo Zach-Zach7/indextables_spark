@@ -77,6 +77,8 @@ Access Unity Catalog-managed S3 paths using temporary credentials from the Datab
 | `spark.indextables.databricks.apiToken` | No* | - | Databricks API token (PAT or OAuth) (*see auth modes below) |
 | `spark.indextables.databricks.clientId` | No | - | OAuth2 client ID (machine-to-machine auth) |
 | `spark.indextables.databricks.clientSecret` | No | - | OAuth2 client secret (machine-to-machine auth) |
+| `spark.indextables.databricks.dbutilsTokenRefresh.enabled` | No | false | Opt-in: on a Databricks driver, seed + auto-refresh the apiToken from the dbutils notebook-context token (see auth modes) |
+| `spark.indextables.databricks.dbutilsTokenRefresh.intervalSeconds` | No | 1800 | Refresh cadence for the dbutils token (under its ~1h TTL) |
 | `spark.indextables.databricks.credential.refreshBuffer.minutes` | No | 40 | Minutes before expiration to refresh |
 | `spark.indextables.databricks.cache.maxSize` | No | 100 | Maximum cached credential entries |
 | `spark.indextables.databricks.fallback.enabled` | No | true | Fallback to READ if READ_WRITE fails |
@@ -100,6 +102,27 @@ Resolved in priority order:
    privileges on the external location.
 
 Outside Databricks compute, either `apiToken` or `clientId`/`clientSecret` must be configured.
+
+#### dbutils token refresh (opt-in, requires the SQL extensions)
+
+On SINGLE_USER Databricks clusters `spark.databricks.token` is absent, so the ambient mode above does not
+apply. There, the dbutils notebook-context token is available **on the driver** and — unlike an external
+OAuth token — bypasses the external-access gate, but it has a short (~1h) TTL. Setting
+`spark.indextables.databricks.dbutilsTokenRefresh.enabled=true` (with `IndexTables4SparkExtensions`
+registered) makes the extension read that token on the driver, publish it as
+`spark.indextables.databricks.apiToken` (tagged `apiToken.source=dbutils`), auto-resolve the workspace URL
+from `spark.databricks.workspaceUrl`, and start a background thread that refreshes it before expiry. The
+provider then re-reads the freshest token on every call rather than pinning it.
+
+This is entirely opt-in and additive — with the flag off (the default) nothing changes, and it never
+overrides an explicitly configured `apiToken`. It never takes priority over OAuth: if `clientId`/`clientSecret`
+are configured they still win, so on Databricks omit them when you want the dbutils token to be used.
+
+**Limitation:** dbutils and the driver session conf are driver-only; the token reaches executors only by
+being serialized into each plan's config map. Streaming micro-batches and multi-job pipelines re-plan and
+therefore pick up refreshed tokens, but a **single job/plan that runs longer than the token TTL** cannot
+refresh its executors' token and will fail once it expires. Chunk such workloads into sub-jobs that complete
+under the TTL.
 
 ### Session-Level Configuration
 ```scala

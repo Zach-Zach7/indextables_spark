@@ -335,6 +335,19 @@ object UnityCatalogAWSCredentialProvider extends io.indextables.spark.utils.Tabl
   private[unity] val AmbientTokenConfKey        = "spark.databricks.token"
   private[unity] val AmbientWorkspaceUrlConfKey = "spark.databricks.workspaceUrl"
 
+  // dbutils-managed apiToken. On SINGLE_USER Databricks clusters `spark.databricks.token` is absent
+  // (see PR #374), but the dbutils notebook-context token IS available on the DRIVER and bypasses the
+  // metastore external-access gate. IndexTables4SparkExtensions reads that token, writes it to
+  // `spark.indextables.databricks.apiToken`, sets `apiToken.source=dbutils` as a marker, and starts a
+  // background thread that refreshes the token (~1h TTL) before it expires. When the marker is set the
+  // provider selects DbutilsRefreshedToken mode and re-reads the freshest token on every call.
+  //   - TokenSourceKey  : bare-leaf marker, resolved via ConfigurationResolver like apiToken
+  //   - DbutilsSourceValue : the marker value that activates DbutilsRefreshedToken mode
+  //   - FullTokenKey    : fully-qualified apiToken key, read directly from the driver's runtime SQLConf
+  private[unity] val TokenSourceKey     = "apiToken.source"
+  private[unity] val DbutilsSourceValue = "dbutils"
+  private[unity] val FullTokenKey       = "spark.indextables.databricks.apiToken"
+
   // Default values
   private val DefaultRefreshBufferMinutes = 40
   private val DefaultCacheMaxSize         = 100
@@ -387,6 +400,28 @@ object UnityCatalogAWSCredentialProvider extends io.indextables.spark.utils.Tabl
       }
     }.toOption.flatten
 
+  /**
+   * Read a key from the active driver SparkSession's runtime SQLConf via reflection.
+   *
+   * This is distinct from [[readSparkEnvConf]]: values set at runtime through `session.conf.set(...)` (as
+   * IndexTables4SparkExtensions does for the dbutils token) live in the RuntimeConfig/SQLConf, NOT in the immutable
+   * startup `SparkConf` that `SparkEnv.get.conf` exposes. `SparkSession.active` exists only on the driver and throws
+   * when no session is active, so on executors (and in plain-JVM tests) this returns None and callers fall back to the
+   * token captured in the per-plan config map.
+   */
+  private[unity] def readActiveSessionConf(key: String): Option[String] =
+    Try {
+      val sessionClass = Class.forName("org.apache.spark.sql.SparkSession")
+      val active       = sessionClass.getMethod("active").invoke(null)
+      val conf         = active.getClass.getMethod("conf").invoke(active)
+      conf.getClass
+        .getMethod("getOption", classOf[String])
+        .invoke(conf, key)
+        .asInstanceOf[Option[String]]
+        .map(_.trim)
+        .filter(_.nonEmpty)
+    }.toOption.flatten
+
   /** The cluster-scoped service token Databricks injects into SparkConf, when running on Databricks compute. */
   private[unity] def resolveAmbientClusterToken(): Option[String] =
     readSparkEnvConf(AmbientTokenConfKey)
@@ -411,8 +446,9 @@ object UnityCatalogAWSCredentialProvider extends io.indextables.spark.utils.Tabl
    * creation.
    *
    * Auth mode priority:
-   *   1. ClientCredentials — when clientId + clientSecret are both present 2. StaticToken — when apiToken is present 3.
-   *      AmbientClusterToken — when running on Databricks compute (spark.databricks.token present in SparkConf) 4.
+   *   1. ClientCredentials — when clientId + clientSecret are both present 2. apiToken present — DbutilsRefreshedToken
+   *      when the apiToken.source=dbutils marker is set (managed by IndexTables4SparkExtensions), otherwise StaticToken
+   *      3. AmbientClusterToken — when running on Databricks compute (spark.databricks.token present in SparkConf) 4.
    *      Error — none of the above
    */
   private def resolveConfigFromMap(config: Map[String, String]): (String, AuthMode, Int, Int) = {
@@ -472,7 +508,21 @@ object UnityCatalogAWSCredentialProvider extends io.indextables.spark.utils.Tabl
         )
       case _ =>
         ConfigurationResolver.resolveString(TokenKey, sources, logMask = true) match {
-          case Some(token) => StaticToken(token)
+          case Some(token) =>
+            // A dbutils-managed apiToken carries an apiToken.source=dbutils marker set by
+            // IndexTables4SparkExtensions (which reads the dbutils notebook-context token on the driver
+            // and refreshes it on a background thread). In that case use DbutilsRefreshedToken so
+            // resolveToken() re-reads the freshest value on every call rather than pinning the token
+            // captured at construction (StaticToken never refreshes). This is purely additive: without
+            // the marker — i.e. for every existing config — resolution is unchanged StaticToken.
+            val isDbutilsManaged = ConfigurationResolver
+              .resolveString(TokenSourceKey, sources)
+              .contains(DbutilsSourceValue)
+            if (isDbutilsManaged) {
+              logger.info("Using dbutils-managed refreshed apiToken for UC credential vending")
+              DbutilsRefreshedToken(token)
+            } else
+              StaticToken(token)
           case None =>
             resolveAmbientClusterToken() match {
               case Some(token) =>
@@ -501,6 +551,9 @@ object UnityCatalogAWSCredentialProvider extends io.indextables.spark.utils.Tabl
                 "(auto-detection via spark.databricks.workspaceUrl found no value)"
             )
           )
+      // StaticToken and DbutilsRefreshedToken both require an explicit workspace URL. For dbutils mode
+      // IndexTables4SparkExtensions sets it (auto-derived from spark.databricks.workspaceUrl) at the same
+      // time it injects the token, so it is present in the config map here.
       case _ => requireExplicitWorkspaceUrl()
     }
 
@@ -618,6 +671,14 @@ object UnityCatalogAWSCredentialProvider extends io.indextables.spark.utils.Tabl
         )
         initialToken
       }
+    case DbutilsRefreshedToken(initialToken) =>
+      // Re-read the freshest token on every call. The refresh thread in IndexTables4SparkExtensions
+      // rewrites `spark.indextables.databricks.apiToken` in the driver's runtime SQLConf before the
+      // ~1h dbutils token expires, so driver-side flows always read a live value here. On executors
+      // there is no active SparkSession, so readActiveSessionConf returns None and we fall back to the
+      // token captured in the per-plan config map — which is itself fresh, because each scan re-plans
+      // on the driver and re-serializes the current token into the task config map.
+      readActiveSessionConf(FullTokenKey).getOrElse(initialToken)
     case cc: ClientCredentials =>
       // Fast path (unsynchronized) — avoids lock contention on the common case.
       val cached = if (globalOAuthTokenCache != null) globalOAuthTokenCache.getIfPresent(cc.clientId) else null
@@ -771,6 +832,9 @@ object UnityCatalogAWSCredentialProvider extends io.indextables.spark.utils.Tabl
     // Fixed identity: there is exactly one cluster token per JVM and the cache is process-global,
     // so a stable string keeps cache entries valid across token rotations (like clientId for OAuth).
     case _: AmbientClusterToken => "ambient-cluster-token"
+    // Same rationale: one dbutils-managed identity per JVM, so a fixed key keeps cached AWS
+    // credentials valid across the background thread's token refreshes.
+    case _: DbutilsRefreshedToken => "dbutils-refreshed-token"
   }
 
   /**
@@ -1158,7 +1222,7 @@ object UnityCatalogAWSCredentialProvider extends io.indextables.spark.utils.Tabl
     defaults
   }
 
-  /** Authentication mode — static API token, OAuth client credentials, or ambient Databricks cluster token. */
+  /** Authentication mode — static API token, OAuth client credentials, ambient cluster token, or dbutils token. */
   sealed private[unity] trait AuthMode
   private[unity] case class StaticToken(token: String) extends AuthMode
 
@@ -1168,6 +1232,16 @@ object UnityCatalogAWSCredentialProvider extends io.indextables.spark.utils.Tabl
    * on every call and only uses `initialToken` if the Spark runtime becomes unreachable.
    */
   private[unity] case class AmbientClusterToken(initialToken: String) extends AuthMode
+
+  /**
+   * dbutils-managed refreshed token auth. Activated when `spark.indextables.databricks.apiToken.source=dbutils` is
+   * present (set by IndexTables4SparkExtensions, which reads the dbutils notebook-context token on the driver and
+   * refreshes it on a background thread). `initialToken` is the value captured from the per-plan config map at
+   * construction; resolveToken() prefers the live value in the driver's runtime SQLConf and falls back to
+   * `initialToken` on executors (where no SparkSession is active). Unlike StaticToken, this mode never pins a token —
+   * it tracks the background thread's rotations so indefinitely-running streaming jobs keep vending past the ~1h TTL.
+   */
+  private[unity] case class DbutilsRefreshedToken(initialToken: String) extends AuthMode
   private[unity] case class ClientCredentials(
     clientId: String,
     clientSecret: String,
